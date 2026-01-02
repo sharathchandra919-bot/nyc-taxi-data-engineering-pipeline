@@ -1,0 +1,117 @@
+# Databricks notebook source
+df = spark.table("workspace.default.taxi_tripdata")
+df.show(5)
+df.printSchema()
+
+# COMMAND ----------
+
+from pyspark.sql.window import Window
+from pyspark.sql.functions import col, row_number,count
+
+bronze_df = spark.table("workspace.default.taxi_tripdata")
+
+windows = Window.partitionBy("lpep_pickup_datetime","PULocationID","DOLocationID").orderBy(col("lpep_pickup_datetime").desc())
+                                                                                                      
+                                                                                                                                                                                               
+silver_df = bronze_df.withColumn("row_number", row_number().over(windows)).filter(col("row_number") == 1).drop("row_number")
+
+silver_df.show(5)
+# bronze_df.select(col("lpep_pickup_datetime")).count()
+# silver_df.select(col("lpep_pickup_datetime")).count()
+
+silver_df.write.mode("overwrite").format("delta").saveAsTable("workspace.default.silver_taxi_tripdata")                                                           
+                                                                                                      
+# silver_df.groupBy("VendorID","lpep_pickup_datetime","PULocationID","DOLocationID").agg(count("*").alias("cnt")).filter("cnt > 1").show(5)                                     
+
+# COMMAND ----------
+
+# bronze_df.filter(
+#     col("lpep_pickup_datetime") == "2021-07-01 00:13:00"
+# ).select(
+#     "VendorID",
+#     "lpep_pickup_datetime",
+#     "PULocationID",
+#     "DOLocationID"
+# ).show(truncate=False)
+
+# bronze_df.filter(col("VendorID").isnull()).count()
+
+from pyspark.sql.functions import sum, when
+
+bronze_df.select(
+    sum(when(col("VendorID").isNull(), 1)).alias("pickup_nulls"),
+    sum(when(col("VendorID").isNotNull(), 1)).alias("not_nulls"),
+    # sum(when(col("DOLocationID").isNull(), 1)).alias("do_nulls")
+).show()
+
+silver_df.select(sum(when(col("VendorID").isNull(), 1)).alias("pickup_null")).show()
+
+bronze_df.select(col("lpep_pickup_datetime")).count()
+
+# COMMAND ----------
+
+watermark = spark.table("workspace.default.silver_taxi_tripdata").agg({"lpep_pickup_datetime":"max"}).collect()[0][0]
+
+bronze_df.filter(col("lpep_pickup_datetime") > watermark)
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col,expr
+last_watermark = "2021-07-10 00:00:00"
+
+incremental_df = bronze_df.filter(col("lpep_pickup_datetime") > expr(f"timestamp('{last_watermark}') - INTERVAL 1 DAY"))
+
+incremental_df.count()
+
+# COMMAND ----------
+
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number, col
+
+windows = Window.partitionBy("lpep_pickup_datetime","PULocationID","DOLocationID").orderBy(col("VendorID").isNull(),col("lpep_pickup_datetime").desc())
+
+incremental_dedup_df = incremental_df.withColumn("row_number", row_number().over(windows)).filter(col("row_number") == 1).drop("row_number")
+
+
+# COMMAND ----------
+
+incremental_dedup_df.createOrReplaceTempView("incremental_updates")
+
+spark.sql("""
+MERGE INTO workspace.default.silver_taxi_tripdata t
+USING incremental_updates s
+ON  t.lpep_pickup_datetime = s.lpep_pickup_datetime
+AND t.PULocationID = s.PULocationID
+AND t.DOLocationID = s.DOLocationID
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *
+""")
+
+
+new_watermark = incremental_dedup_df.agg({"lpep_dropoff_datetime":"max"}).collect()[0][0]
+
+incremental_dedup_df.count()
+
+spark.table("workspace.default.silver_taxi_tripdata").count()
+
+print("ADF watermark:", last_watermark)
+
+print("ADF would update watermark to:", new_watermark)
+
+
+
+# COMMAND ----------
+
+#gold layer
+
+from pyspark.sql.functions import col,coalesce,lit,to_date,sum,avg,count
+
+silver_df = spark.table("workspace.default.silver_taxi_tripdata")
+
+gold_df = silver_df.withColumn("pickup_date",to_date(col("lpep_pickup_datetime"))).withColumn("VendorID_clean",coalesce(col("VendorID").cast("string"),lit("UNKNOWN")))
+
+gold_daily_metrics = gold_df.groupBy("pickup_date","VendorID_clean").agg(count("*").alias("cnt"),sum("total_amount").alias("total_amount"),avg("trip_distance").alias("avg_trip_distance"))
+
+gold_daily_metrics.write.mode("overwrite").format("delta").saveAsTable("workspace.default.gold_taxi_tripdata")
+
+spark.table("workspace.default.gold_taxi_tripdata").count()
